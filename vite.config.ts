@@ -10,6 +10,9 @@ export default defineConfig((config) => {
     build: {
       target: 'esnext',
     },
+    test: {
+      setupFiles: ['./tests/setup.ts'],
+    },
     plugins: [
       nodePolyfills({
         include: ['path', 'buffer'],

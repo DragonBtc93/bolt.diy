@@ -1,17 +1,13 @@
-import type { PathWatcherEvent, WebContainer } from '@webcontainer/api';
-import { getEncoding } from 'istextorbinary';
+import type { WebContainer } from '@webcontainer/api';
 import { map, type MapStore } from 'nanostores';
-import { Buffer } from 'node:buffer';
 import * as nodePath from 'node:path';
-import { bufferWatchEvents } from '~/utils/buffer';
 import { WORK_DIR } from '~/utils/constants';
 import { computeFileModifications } from '~/utils/diff';
 import { createScopedLogger } from '~/utils/logger';
 import { unreachable } from '~/utils/unreachable';
+import FileWatcherWorker from '~/lib/webcontainer/file-watcher.worker?worker';
 
 const logger = createScopedLogger('FilesStore');
-
-const utf8TextDecoder = new TextDecoder('utf8', { fatal: true });
 
 export interface File {
   type: 'file';
@@ -29,6 +25,7 @@ export type FileMap = Record<string, Dirent | undefined>;
 
 export class FilesStore {
   #webcontainer: Promise<WebContainer>;
+  #worker: Worker;
 
   /**
    * Tracks the number of files without folders.
@@ -53,13 +50,21 @@ export class FilesStore {
 
   constructor(webcontainerPromise: Promise<WebContainer>) {
     this.#webcontainer = webcontainerPromise;
+    this.#worker = new FileWatcherWorker();
+
+    this.#worker.onmessage = (event) => {
+      if (event.data.type === 'update') {
+        this.files.set(event.data.fileMap);
+        this.#size = event.data.size;
+      }
+    };
 
     if (import.meta.hot) {
       import.meta.hot.data.files = this.files;
       import.meta.hot.data.modifiedFiles = this.#modifiedFiles;
     }
 
-    this.#init();
+    void this.#init();
   }
 
   getFile(filePath: string) {
@@ -116,103 +121,12 @@ export class FilesStore {
   async #init() {
     const webcontainer = await this.#webcontainer;
 
+    this.#worker.postMessage({ type: 'init', fileMap: this.files.get(), size: this.#size });
+
     webcontainer.internal.watchPaths(
       { include: [`${WORK_DIR}/**`], exclude: ['**/node_modules', '.git'], includeContent: true },
-      bufferWatchEvents(200, 50, this.#processEventBuffer.bind(this)),
+      // Send each event to the worker for batching and processing
+      (events) => this.#worker.postMessage({ type: 'event', event: [events] }),
     );
   }
-
-  #processEventBuffer(events: Array<[events: PathWatcherEvent[]]>) {
-    const watchEvents = events.flat(2);
-    const newFileMap = { ...this.files.get() };
-
-    for (const { type, path, buffer } of watchEvents) {
-      // remove any trailing slashes
-      const sanitizedPath = path.replace(/\/+$/g, '');
-
-      switch (type) {
-        case 'add_dir': {
-          // we intentionally add a trailing slash so we can distinguish files from folders in the file tree
-          newFileMap[sanitizedPath] = { type: 'folder' };
-          break;
-        }
-        case 'remove_dir': {
-          delete newFileMap[sanitizedPath];
-
-          for (const direntPath in newFileMap) {
-            if (direntPath.startsWith(`${sanitizedPath}/`)) {
-              delete newFileMap[direntPath];
-            }
-          }
-
-          break;
-        }
-        case 'add_file':
-        case 'change': {
-          if (type === 'add_file') {
-            this.#size++;
-          }
-
-          let content = '';
-
-          /**
-           * @note This check is purely for the editor. The way we detect this is not
-           * bullet-proof and it's a best guess so there might be false-positives.
-           * The reason we do this is because we don't want to display binary files
-           * in the editor nor allow to edit them.
-           */
-          const isBinary = isBinaryFile(buffer);
-
-          if (!isBinary) {
-            content = this.#decodeFileContent(buffer);
-          }
-
-          newFileMap[sanitizedPath] = { type: 'file', content, isBinary };
-
-          break;
-        }
-        case 'remove_file': {
-          this.#size--;
-          delete newFileMap[sanitizedPath];
-          break;
-        }
-        case 'update_directory': {
-          // we don't care about these events
-          break;
-        }
-      }
-    }
-    this.files.set(newFileMap);
-  }
-
-  #decodeFileContent(buffer?: Uint8Array) {
-    if (!buffer || buffer.byteLength === 0) {
-      return '';
-    }
-
-    try {
-      return utf8TextDecoder.decode(buffer);
-    } catch (error) {
-      console.log(error);
-      return '';
-    }
-  }
-}
-
-function isBinaryFile(buffer: Uint8Array | undefined) {
-  if (buffer === undefined) {
-    return false;
-  }
-
-  return getEncoding(convertToBuffer(buffer), { chunkLength: 100 }) === 'binary';
-}
-
-/**
- * Converts a `Uint8Array` into a Node.js `Buffer` by copying the prototype.
- * The goal is to  avoid expensive copies. It does create a new typed array
- * but that's generally cheap as long as it uses the same underlying
- * array buffer.
- */
-function convertToBuffer(view: Uint8Array): Buffer {
-  return Buffer.from(view.buffer, view.byteOffset, view.byteLength);
 }
