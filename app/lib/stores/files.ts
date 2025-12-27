@@ -118,12 +118,13 @@ export class FilesStore {
 
     webcontainer.internal.watchPaths(
       { include: [`${WORK_DIR}/**`], exclude: ['**/node_modules', '.git'], includeContent: true },
-      bufferWatchEvents(100, this.#processEventBuffer.bind(this)),
+      bufferWatchEvents(200, 50, this.#processEventBuffer.bind(this)),
     );
   }
 
   #processEventBuffer(events: Array<[events: PathWatcherEvent[]]>) {
     const watchEvents = events.flat(2);
+    const newFileMap = { ...this.files.get() };
 
     for (const { type, path, buffer } of watchEvents) {
       // remove any trailing slashes
@@ -132,15 +133,15 @@ export class FilesStore {
       switch (type) {
         case 'add_dir': {
           // we intentionally add a trailing slash so we can distinguish files from folders in the file tree
-          this.files.setKey(sanitizedPath, { type: 'folder' });
+          newFileMap[sanitizedPath] = { type: 'folder' };
           break;
         }
         case 'remove_dir': {
-          this.files.setKey(sanitizedPath, undefined);
+          delete newFileMap[sanitizedPath];
 
-          for (const [direntPath] of Object.entries(this.files)) {
-            if (direntPath.startsWith(sanitizedPath)) {
-              this.files.setKey(direntPath, undefined);
+          for (const direntPath in newFileMap) {
+            if (direntPath.startsWith(`${sanitizedPath}/`)) {
+              delete newFileMap[direntPath];
             }
           }
 
@@ -166,13 +167,13 @@ export class FilesStore {
             content = this.#decodeFileContent(buffer);
           }
 
-          this.files.setKey(sanitizedPath, { type: 'file', content, isBinary });
+          newFileMap[sanitizedPath] = { type: 'file', content, isBinary };
 
           break;
         }
         case 'remove_file': {
           this.#size--;
-          this.files.setKey(sanitizedPath, undefined);
+          delete newFileMap[sanitizedPath];
           break;
         }
         case 'update_directory': {
@@ -181,6 +182,7 @@ export class FilesStore {
         }
       }
     }
+    this.files.set(newFileMap);
   }
 
   #decodeFileContent(buffer?: Uint8Array) {
